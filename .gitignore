@@ -1,6 +1,8 @@
 run.log
 train.log
+run_*.log
 results.tsv
+.hive/
 __pycache__/
 *.pyc
 .env
