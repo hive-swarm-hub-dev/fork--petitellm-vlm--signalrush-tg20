@@ -47,8 +47,8 @@ class HP:
     max_text_len = int(os.environ.get("MAX_TEXT_LEN", 384))
     max_answer_len = int(os.environ.get("MAX_ANSWER_LEN", 16))
     use_lora = os.environ.get("USE_LORA", "1") not in ("0", "false", "False")
-    lora_rank = int(os.environ.get("LORA_RANK", 16))
-    lora_alpha = int(os.environ.get("LORA_ALPHA", 32))
+    lora_rank = int(os.environ.get("LORA_RANK", 32))
+    lora_alpha = int(os.environ.get("LORA_ALPHA", 64))
     projection_type = os.environ.get("PROJECTION_TYPE", "mlp")  # linear|mlp
     projection_hidden = int(os.environ.get("PROJECTION_HIDDEN", 1024))
     cosine_decay = os.environ.get("COSINE_DECAY", "1") not in ("0", "false", "False")
@@ -198,7 +198,10 @@ def save_lora(llm, path: str):
         from peft import PeftModel
         if not isinstance(llm, PeftModel):
             return 0
-        sd = {k: v.detach().cpu() for k, v in llm.state_dict().items()
+        # Cast LoRA tensors to bf16 on save: peft stores them in fp32 by default,
+        # which doubles the artifact. Loss in inference accuracy is negligible
+        # and load_lora casts back to the target module dtype.
+        sd = {k: v.detach().to(torch.bfloat16).cpu() for k, v in llm.state_dict().items()
               if "lora_" in k}
         from safetensors.torch import save_file
         save_file(sd, path)
