@@ -1,0 +1,11 @@
+run.log
+train.log
+results.tsv
+__pycache__/
+*.pyc
+.env
+data/
+models/
+final_projection.pt
+final_projection.ptz
+final_lora.safetensors
