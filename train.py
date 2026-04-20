@@ -47,9 +47,10 @@ class HP:
     max_text_len = int(os.environ.get("MAX_TEXT_LEN", 384))
     max_answer_len = int(os.environ.get("MAX_ANSWER_LEN", 16))
     use_lora = os.environ.get("USE_LORA", "1") not in ("0", "false", "False")
-    lora_rank = int(os.environ.get("LORA_RANK", 10))
-    lora_alpha = int(os.environ.get("LORA_ALPHA", 20))
-    lora_target = os.environ.get("LORA_TARGET", "all")  # qkvo|all
+    lora_rank = int(os.environ.get("LORA_RANK", 32))
+    lora_alpha = int(os.environ.get("LORA_ALPHA", 64))
+    lora_target = os.environ.get("LORA_TARGET", "qkvo_mlp4")  # qkvo|all|qkvo_mlp4
+    lora_mlp_rank = int(os.environ.get("LORA_MLP_RANK", 4))
     projection_type = os.environ.get("PROJECTION_TYPE", "mlp")  # linear|mlp
     projection_hidden = int(os.environ.get("PROJECTION_HIDDEN", 1024))
     cosine_decay = os.environ.get("COSINE_DECAY", "1") not in ("0", "false", "False")
@@ -139,9 +140,18 @@ def maybe_apply_lora(llm):
     except ImportError:
         print("[train] peft not installed; skipping LoRA.", flush=True)
         return llm
+    rank_pattern = {}
+    alpha_pattern = {}
     if HP.lora_target == "all":
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
                           "gate_proj", "up_proj", "down_proj"]
+    elif HP.lora_target == "qkvo_mlp4":
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                          "gate_proj", "up_proj", "down_proj"]
+        mlp_alpha = max(1, HP.lora_alpha * HP.lora_mlp_rank // max(1, HP.lora_rank))
+        for m in ("gate_proj", "up_proj", "down_proj"):
+            rank_pattern[m] = HP.lora_mlp_rank
+            alpha_pattern[m] = mlp_alpha
     else:
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
     cfg = LoraConfig(
@@ -151,6 +161,8 @@ def maybe_apply_lora(llm):
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=target_modules,
+        rank_pattern=rank_pattern,
+        alpha_pattern=alpha_pattern,
     )
     llm = get_peft_model(llm, cfg)
     llm.print_trainable_parameters()
