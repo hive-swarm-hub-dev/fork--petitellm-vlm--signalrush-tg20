@@ -90,7 +90,8 @@ class HP:
     ema_start_step = int(os.environ.get("EMA_START_STEP", 100))
     # LoRA dropout — standard SFT regularizer, helps small-data overfitting.
     # Verified: 0.7800 vs 0.7720 without (dropout=0.0), single-seed.
-    lora_dropout = float(os.environ.get("LORA_DROPOUT", 0.1))
+    # Train loss still drops to ~0.04 at budget end (memorization), so try heavier regularization.
+    lora_dropout = float(os.environ.get("LORA_DROPOUT", 0.2))
 
 
 # ----------------------------- prompt -----------------------------
