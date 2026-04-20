@@ -131,8 +131,9 @@ class LinearProjection(nn.Module):
 
 
 class MLPProjection(nn.Module):
-    def __init__(self, in_dim: int, hidden: int, out_dim: int):
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, pool: int = 1):
         super().__init__()
+        self.pool = pool  # 2D avg-pool factor; 1=off, 2=4x token reduction, etc.
         self.fc1 = nn.Linear(in_dim, hidden)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden, out_dim)
@@ -140,12 +141,21 @@ class MLPProjection(nn.Module):
         _init_proj_linear(self.fc2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N=H*W, D). Optional 2D avg-pool to reduce token count.
+        if self.pool > 1:
+            B, N, D = x.shape
+            side = int(math.isqrt(N))
+            if side * side == N:
+                xr = x.view(B, side, side, D).permute(0, 3, 1, 2)  # (B, D, H, W)
+                xr = F.avg_pool2d(xr, kernel_size=self.pool, stride=self.pool)
+                x = xr.permute(0, 2, 3, 1).reshape(B, -1, D)
         return self.fc2(self.act(self.fc1(x)))
 
 
 def make_projection(kind: str, in_dim: int, out_dim: int, hidden: int) -> nn.Module:
+    pool = int(os.environ.get("PROJ_POOL", 2))  # 2 → 196→49 tokens via 2D avg-pool
     if kind == "mlp":
-        return MLPProjection(in_dim, hidden, out_dim)
+        return MLPProjection(in_dim, hidden, out_dim, pool=pool)
     return LinearProjection(in_dim, out_dim)
 
 
