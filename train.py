@@ -22,6 +22,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 import zlib
@@ -52,6 +53,9 @@ class HP:
     projection_type = os.environ.get("PROJECTION_TYPE", "mlp")  # linear|mlp
     projection_hidden = int(os.environ.get("PROJECTION_HIDDEN", 1024))
     cosine_decay = os.environ.get("COSINE_DECAY", "1") not in ("0", "false", "False")
+    # Probability of shuffling multiple-choice options per training example.
+    # Observed 20% B→A confusion at eval — the model leans on option position.
+    choice_shuffle_prob = float(os.environ.get("CHOICE_SHUFFLE_PROB", 0.7))
 
 
 # ----------------------------- prompt -----------------------------
@@ -152,6 +156,47 @@ def maybe_apply_lora(llm):
 
 
 # ----------------------------- data -----------------------------
+
+
+_CHOICES_RE = re.compile(r"(?P<prefix>Choices:\s*\n)(?P<block>(?:\([A-E]\)[^\n]*\n?)+)")
+_CHOICE_LINE_RE = re.compile(r"\(([A-E])\)\s*(.*)")
+
+
+def shuffle_choices(prompt: str, answer: str, rng: random.Random) -> tuple[str, str]:
+    """Randomize the order of (A)/(B)/... options in the prompt and remap the gold letter.
+
+    Returns (new_prompt, new_answer). If the prompt has no Choices: block, returns inputs
+    unchanged.
+    """
+    m = _CHOICES_RE.search(prompt)
+    if not m:
+        return prompt, answer
+    lines = [ln for ln in m.group("block").split("\n") if ln.strip()]
+    parsed = []
+    for ln in lines:
+        mm = _CHOICE_LINE_RE.match(ln.strip())
+        if not mm:
+            return prompt, answer  # malformed; skip aug
+        parsed.append((mm.group(1), mm.group(2)))
+    if len(parsed) < 2:
+        return prompt, answer
+    content_by_letter = dict(parsed)
+    if answer not in content_by_letter:
+        return prompt, answer
+    gold_content = content_by_letter[answer]
+    letters = [p[0] for p in parsed]
+    contents = [p[1] for p in parsed]
+    rng.shuffle(contents)
+    new_block_lines = [f"({letters[i]}) {contents[i]}" for i in range(len(parsed))]
+    new_gold = None
+    for i, c in enumerate(contents):
+        if c == gold_content:
+            new_gold = letters[i]; break
+    if new_gold is None:
+        return prompt, answer
+    new_block = "\n".join(new_block_lines)
+    new_prompt = prompt[:m.start("block")] + new_block + ("\n" if m.group("block").endswith("\n") else "") + prompt[m.end("block"):]
+    return new_prompt, new_gold
 
 
 class SqaDataset:
@@ -257,6 +302,7 @@ def build_training_batch(tokenizer, ds: SqaDataset, rng, device, llm, proj, llm_
     feats = []
     prompts = []
     full_texts = []
+    py_rng = random.Random(int(rng.integers(0, 1 << 31)))
     for ex in examples:
         feat_path = Path(f"data/vision_cache/{ex['image_id']}.pt")
         if not feat_path.exists():
@@ -264,8 +310,11 @@ def build_training_batch(tokenizer, ds: SqaDataset, rng, device, llm, proj, llm_
             continue
         f16 = torch.load(feat_path, map_location="cpu")
         feats.append(f16)
-        prompts.append(prompt_template(ex["prompt"]))
-        full_texts.append(prompt_template(ex["prompt"]) + ex["answer"] + tokenizer.eos_token)
+        prompt, answer = ex["prompt"], ex["answer"]
+        if HP.choice_shuffle_prob > 0 and py_rng.random() < HP.choice_shuffle_prob:
+            prompt, answer = shuffle_choices(prompt, answer, py_rng)
+        prompts.append(prompt_template(prompt))
+        full_texts.append(prompt_template(prompt) + answer + tokenizer.eos_token)
     if not feats:
         return None
     feats_t = torch.stack(feats).to(device).float()
