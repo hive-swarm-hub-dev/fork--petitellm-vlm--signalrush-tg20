@@ -49,7 +49,7 @@ class HP:
     use_lora = os.environ.get("USE_LORA", "1") not in ("0", "false", "False")
     lora_rank = int(os.environ.get("LORA_RANK", 32))
     lora_alpha = int(os.environ.get("LORA_ALPHA", 64))
-    lora_target = os.environ.get("LORA_TARGET", "qkvo_mlp4")  # qkvo|all|qkvo_mlp4
+    lora_target = os.environ.get("LORA_TARGET", "qkvo")  # qkvo|all|qkvo_mlp4
     lora_mlp_rank = int(os.environ.get("LORA_MLP_RANK", 4))
     projection_type = os.environ.get("PROJECTION_TYPE", "mlp")  # linear|mlp
     projection_hidden = int(os.environ.get("PROJECTION_HIDDEN", 1024))
@@ -59,10 +59,15 @@ class HP:
 # ----------------------------- prompt -----------------------------
 
 
+PROMPT_STYLE = os.environ.get("PROMPT_STYLE", "qa")  # chat|qa
 SYSTEM_PROMPT = "You are a helpful visual assistant. Answer concisely with the correct option letter only."
 
 def prompt_template(question: str) -> str:
-    return f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+    if PROMPT_STYLE == "chat":
+        return f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+    # Minimal QA format: base Qwen2.5-0.5B saw plenty of "Q: ... A: " style in
+    # pretraining but has no instruction-tuning on the chat template.
+    return f"Question: {question}\nAnswer:"
 
 
 # ----------------------------- projection -----------------------------
@@ -282,8 +287,14 @@ def build_training_batch(tokenizer, ds: SqaDataset, rng, device, llm, proj, llm_
             continue
         f16 = torch.load(feat_path, map_location="cpu")
         feats.append(f16)
-        prompts.append(prompt_template(ex["prompt"]))
-        full_texts.append(prompt_template(ex["prompt"]) + ex["answer"] + tokenizer.eos_token)
+        pt = prompt_template(ex["prompt"])
+        prompts.append(pt)
+        # Chat-template prompts end with '\n' so "A" tokenizes cleanly as its own
+        # token. The simpler "Answer:" template ends at ':', where "A" would
+        # fuse into the ':A' subword and drift from the eval-time tokenization.
+        # Insert a space so both styles produce " A" (token 362) as the answer.
+        sep = "" if pt.endswith("\n") else " "
+        full_texts.append(pt + sep + ex["answer"] + tokenizer.eos_token)
     if not feats:
         return None
     feats_t = torch.stack(feats).to(device).float()
