@@ -49,8 +49,8 @@ class HP:
     max_text_len = int(os.environ.get("MAX_TEXT_LEN", 384))
     max_answer_len = int(os.environ.get("MAX_ANSWER_LEN", 16))
     use_lora = os.environ.get("USE_LORA", "1") not in ("0", "false", "False")
-    lora_rank = int(os.environ.get("LORA_RANK", 32))
-    lora_alpha = int(os.environ.get("LORA_ALPHA", 64))
+    lora_rank = int(os.environ.get("LORA_RANK", 44))
+    lora_alpha = int(os.environ.get("LORA_ALPHA", 88))
     lora_target = os.environ.get("LORA_TARGET", "qkvo")  # qkvo|all|qkvo_mlp4
     lora_mlp_rank = int(os.environ.get("LORA_MLP_RANK", 4))
     projection_type = os.environ.get("PROJECTION_TYPE", "mlp")  # linear|mlp
@@ -63,7 +63,7 @@ class HP:
     val_max_examples = int(os.environ.get("VAL_MAX_EXAMPLES", 500))
     # Stage-wise training: hold LoRA LR at 0 until this step so the projection
     # can align with the frozen LM's embedding space first (LLaVA-style stage 1).
-    lora_start_step = int(os.environ.get("LORA_START_STEP", 300))
+    lora_start_step = int(os.environ.get("LORA_START_STEP", 0))
     cosine_decay = os.environ.get("COSINE_DECAY", "1") not in ("0", "false", "False")
 
 
