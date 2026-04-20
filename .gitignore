@@ -11,3 +11,4 @@ models/
 final_projection.pt
 final_projection.ptz
 final_lora.safetensors
+.claude/
