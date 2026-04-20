@@ -54,10 +54,11 @@ class HP:
     projection_hidden = int(os.environ.get("PROJECTION_HIDDEN", 1024))
     cosine_decay = os.environ.get("COSINE_DECAY", "1") not in ("0", "false", "False")
     # Probability of shuffling multiple-choice options per training example.
-    # Observed 20% B→A confusion at eval — the model leans on option position.
-    # Turning on at 1.0: shuffles every example, effectively multiplying data by
-    # ~k! (k = #choices) and destroying position bias in the (letter, content) map.
-    choice_shuffle_prob = float(os.environ.get("CHOICE_SHUFFLE_PROB", 1.0))
+    # Tested 1.0: landed 0.7280 (-0.052, outside noise) — aggressive always-shuffle
+    # destroys letter-calibration since eval has fixed letter positions. Off.
+    choice_shuffle_prob = float(os.environ.get("CHOICE_SHUFFLE_PROB", 0.0))
+    # Weight decay on LoRA params — orthogonal regularizer to dropout, standard SFT trick.
+    lora_wd = float(os.environ.get("LORA_WD", 0.01))
     # NEFTune (Jain et al. 2023): add uniform noise to text embeddings during
     # SFT. magnitude = alpha / sqrt(L*D). Paper default alpha=5 → ~+15% on small
     # instruction-tuning sets. Applied only in training, not eval.
@@ -524,14 +525,14 @@ def main():
             lora_b_params.append(p)
         else:
             lora_a_params.append(p)
-    param_groups = [{"params": proj_params, "lr": HP.lr_proj, "group": "proj"}]
+    param_groups = [{"params": proj_params, "lr": HP.lr_proj, "group": "proj", "weight_decay": 0.0}]
     if lora_a_params:
-        param_groups.append({"params": lora_a_params, "lr": HP.lr_lora, "group": "loraA"})
+        param_groups.append({"params": lora_a_params, "lr": HP.lr_lora, "group": "loraA", "weight_decay": HP.lora_wd})
     if lora_b_params:
         lr_b = HP.lr_lora * HP.lora_plus_ratio
-        param_groups.append({"params": lora_b_params, "lr": lr_b, "group": "loraB"})
-    print(f"optimizer groups: {[(g['group'], len(g['params']), g['lr']) for g in param_groups]}", flush=True)
-    opt = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), weight_decay=0.0)
+        param_groups.append({"params": lora_b_params, "lr": lr_b, "group": "loraB", "weight_decay": HP.lora_wd})
+    print(f"optimizer groups: {[(g['group'], len(g['params']), g['lr'], g['weight_decay']) for g in param_groups]}", flush=True)
+    opt = torch.optim.AdamW(param_groups, betas=(0.9, 0.95))
 
     # EMA shadow state — populated lazily on first post-warmup step.
     ema_proj_sd = None
