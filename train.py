@@ -47,8 +47,9 @@ class HP:
     max_text_len = int(os.environ.get("MAX_TEXT_LEN", 384))
     max_answer_len = int(os.environ.get("MAX_ANSWER_LEN", 16))
     use_lora = os.environ.get("USE_LORA", "1") not in ("0", "false", "False")
-    lora_rank = int(os.environ.get("LORA_RANK", 32))
-    lora_alpha = int(os.environ.get("LORA_ALPHA", 64))
+    lora_rank = int(os.environ.get("LORA_RANK", 10))
+    lora_alpha = int(os.environ.get("LORA_ALPHA", 20))
+    lora_target = os.environ.get("LORA_TARGET", "all")  # qkvo|all
     projection_type = os.environ.get("PROJECTION_TYPE", "mlp")  # linear|mlp
     projection_hidden = int(os.environ.get("PROJECTION_HIDDEN", 1024))
     cosine_decay = os.environ.get("COSINE_DECAY", "1") not in ("0", "false", "False")
@@ -138,13 +139,18 @@ def maybe_apply_lora(llm):
     except ImportError:
         print("[train] peft not installed; skipping LoRA.", flush=True)
         return llm
+    if HP.lora_target == "all":
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                          "gate_proj", "up_proj", "down_proj"]
+    else:
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
     cfg = LoraConfig(
         r=HP.lora_rank,
         lora_alpha=HP.lora_alpha,
         lora_dropout=0.0,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=target_modules,
     )
     llm = get_peft_model(llm, cfg)
     llm.print_trainable_parameters()
