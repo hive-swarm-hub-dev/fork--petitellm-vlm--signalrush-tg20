@@ -57,8 +57,9 @@ class HP:
     # Tested 1.0: landed 0.7280 (-0.052, outside noise) — aggressive always-shuffle
     # destroys letter-calibration since eval has fixed letter positions. Off.
     choice_shuffle_prob = float(os.environ.get("CHOICE_SHUFFLE_PROB", 0.0))
-    # Weight decay on LoRA params — orthogonal regularizer to dropout, standard SFT trick.
-    lora_wd = float(os.environ.get("LORA_WD", 0.01))
+    # Weight decay on LoRA params. Tested 0.01 → 0.6980 (-0.082, big regression).
+    # Too aggressive — shrinks LoRA magnitudes that are already small.
+    lora_wd = float(os.environ.get("LORA_WD", 0.0))
     # NEFTune (Jain et al. 2023): add uniform noise to text embeddings during
     # SFT. magnitude = alpha / sqrt(L*D). Paper default alpha=5 → ~+15% on small
     # instruction-tuning sets. Applied only in training, not eval.
