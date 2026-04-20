@@ -55,16 +55,29 @@ class HP:
     cosine_decay = os.environ.get("COSINE_DECAY", "1") not in ("0", "false", "False")
     # Probability of shuffling multiple-choice options per training example.
     # Observed 20% B→A confusion at eval — the model leans on option position.
-    choice_shuffle_prob = float(os.environ.get("CHOICE_SHUFFLE_PROB", 0.7))
+    choice_shuffle_prob = float(os.environ.get("CHOICE_SHUFFLE_PROB", 0.0))
+    # NEFTune (Jain et al. 2023): add uniform noise to text embeddings during
+    # SFT. magnitude = alpha / sqrt(L*D). Paper default alpha=5 → ~+15% on small
+    # instruction-tuning sets. Applied only in training, not eval.
+    neft_alpha = float(os.environ.get("NEFT_ALPHA", 5.0))
+    # DoRA (Liu et al. 2024): weight-decomposed LoRA — adds a learnable magnitude
+    # per adapted weight column. PEFT flips this on with use_dora=True.
+    use_dora = os.environ.get("USE_DORA", "1") not in ("0", "false", "False")
+    # LoRA+ (Hayou et al. 2024): scale the LR for the B matrix (up-projector)
+    # relative to A (down-projector). Paper recommends ratio around 16.
+    lora_plus_ratio = float(os.environ.get("LORA_PLUS_RATIO", 16.0))
 
 
 # ----------------------------- prompt -----------------------------
 
 
 SYSTEM_PROMPT = "You are a helpful visual assistant. Answer concisely with the correct option letter only."
+USE_SYSTEM_PROMPT = os.environ.get("USE_SYSTEM_PROMPT", "1") not in ("0", "false", "False")
 
 def prompt_template(question: str) -> str:
-    return f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+    if USE_SYSTEM_PROMPT:
+        return f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+    return f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
 
 
 # ----------------------------- projection -----------------------------
@@ -142,7 +155,7 @@ def maybe_apply_lora(llm):
     except ImportError:
         print("[train] peft not installed; skipping LoRA.", flush=True)
         return llm
-    cfg = LoraConfig(
+    cfg_kwargs = dict(
         r=HP.lora_rank,
         lora_alpha=HP.lora_alpha,
         lora_dropout=0.0,
@@ -150,6 +163,9 @@ def maybe_apply_lora(llm):
         task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     )
+    if HP.use_dora:
+        cfg_kwargs["use_dora"] = True
+    cfg = LoraConfig(**cfg_kwargs)
     llm = get_peft_model(llm, cfg)
     llm.print_trainable_parameters()
     return llm
@@ -331,6 +347,15 @@ def build_training_batch(tokenizer, ds: SqaDataset, rng, device, llm, proj, llm_
     prompt_lens = prompt_mask.sum(dim=1)
 
     text_embeds = llm.get_input_embeddings()(full_ids).to(llm_dtype)
+    # NEFTune: add uniform noise to text embeddings during training only.
+    # noise ~ U[-mag, mag] with mag = alpha / sqrt(L*D). Applied after label
+    # construction so no noise on labels, only on inputs.
+    if HP.neft_alpha > 0:
+        L_text = text_embeds.size(1)
+        D_text = text_embeds.size(-1)
+        mag = HP.neft_alpha / math.sqrt(L_text * D_text)
+        noise = (torch.rand_like(text_embeds, dtype=text_embeds.dtype) - 0.5) * (2.0 * mag)
+        text_embeds = text_embeds + noise
     inputs_embeds = torch.cat([projected, text_embeds], dim=1)
     img_mask = torch.ones(B, Np, dtype=full_mask.dtype, device=device)
     attn_mask = torch.cat([img_mask, full_mask], dim=1)
@@ -383,10 +408,24 @@ def main():
 
     # Optimizer groups.
     proj_params = list(proj.parameters())
-    lora_params = [p for p in llm.parameters() if p.requires_grad]
-    param_groups = [{"params": proj_params, "lr": HP.lr_proj}]
-    if lora_params:
-        param_groups.append({"params": lora_params, "lr": HP.lr_lora})
+    # LoRA+ (Hayou 2024): split LoRA into A and B matrices, give B a higher LR.
+    # In PEFT, parameter names contain "lora_A" / "lora_B". DoRA's magnitude
+    # vector ("lora_magnitude_vector") is grouped with A for safety.
+    lora_a_params, lora_b_params = [], []
+    for name, p in llm.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "lora_B" in name:
+            lora_b_params.append(p)
+        else:
+            lora_a_params.append(p)
+    param_groups = [{"params": proj_params, "lr": HP.lr_proj, "group": "proj"}]
+    if lora_a_params:
+        param_groups.append({"params": lora_a_params, "lr": HP.lr_lora, "group": "loraA"})
+    if lora_b_params:
+        lr_b = HP.lr_lora * HP.lora_plus_ratio
+        param_groups.append({"params": lora_b_params, "lr": lr_b, "group": "loraB"})
+    print(f"optimizer groups: {[(g['group'], len(g['params']), g['lr']) for g in param_groups]}", flush=True)
     opt = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), weight_decay=0.0)
 
     start = time.time()
@@ -400,9 +439,16 @@ def main():
         elapsed = time.time() - start
         if elapsed >= HP.max_wallclock_seconds:
             break
-        opt.param_groups[0]["lr"] = lr_at(step, HP.lr_proj, HP.warmup_steps, est_total_steps, HP.cosine_decay)
-        if len(opt.param_groups) > 1:
-            opt.param_groups[1]["lr"] = lr_at(step, HP.lr_lora, HP.warmup_steps, est_total_steps, HP.cosine_decay)
+        for g in opt.param_groups:
+            if g.get("group") == "proj":
+                peak = HP.lr_proj
+            elif g.get("group") == "loraA":
+                peak = HP.lr_lora
+            elif g.get("group") == "loraB":
+                peak = HP.lr_lora * HP.lora_plus_ratio
+            else:
+                peak = g["lr"]
+            g["lr"] = lr_at(step, peak, HP.warmup_steps, est_total_steps, HP.cosine_decay)
 
         batch = build_training_batch(tokenizer, train_ds, rng, device, llm, proj, llm_dtype)
         if batch is None:
