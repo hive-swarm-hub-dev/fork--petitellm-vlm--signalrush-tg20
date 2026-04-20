@@ -153,7 +153,9 @@ class MLPProjection(nn.Module):
 
 
 def make_projection(kind: str, in_dim: int, out_dim: int, hidden: int) -> nn.Module:
-    pool = int(os.environ.get("PROJ_POOL", 2))  # 2 → 196→49 tokens via 2D avg-pool
+    # Tested pool=2 (196→49 tokens): 0.7400, -0.04 vs top. 4x fewer visual tokens
+    # gave +24% training steps but lost too much fine-grained SigLIP detail.
+    pool = int(os.environ.get("PROJ_POOL", 1))
     if kind == "mlp":
         return MLPProjection(in_dim, hidden, out_dim, pool=pool)
     return LinearProjection(in_dim, out_dim)
