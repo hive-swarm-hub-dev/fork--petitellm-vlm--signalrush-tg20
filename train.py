@@ -70,6 +70,13 @@ class HP:
     # LoRA+ (Hayou et al. 2024): scale the LR for the B matrix (up-projector)
     # relative to A (down-projector). Paper recommends ratio around 16.
     lora_plus_ratio = float(os.environ.get("LORA_PLUS_RATIO", 1.0))
+    # RSLoRA (Kalajdzievski 2023): scale adapter by α/√r instead of α/r so effective
+    # LR doesn't collapse as rank grows. PEFT supports via use_rslora=True.
+    use_rslora = os.environ.get("USE_RSLORA", "1") not in ("0", "false", "False")
+    # Letter-constrained decoding (LLaVA-1.5 / Cambrian-1 MCQ protocol): at eval time,
+    # mask all non-{A..E} tokens on the first generated token so the model cannot
+    # emit "The" or " (" or whitespace that would torpedo the regex answer extract.
+    letter_constraint = os.environ.get("LETTER_CONSTRAINT", "1") not in ("0", "false", "False")
 
 
 # ----------------------------- prompt -----------------------------
@@ -169,6 +176,8 @@ def maybe_apply_lora(llm):
     )
     if HP.use_dora:
         cfg_kwargs["use_dora"] = True
+    if HP.use_rslora:
+        cfg_kwargs["use_rslora"] = True
     cfg = LoraConfig(**cfg_kwargs)
     llm = get_peft_model(llm, cfg)
     llm.print_trainable_parameters()
@@ -296,6 +305,56 @@ def load_lora(llm, path: str):
 # ----------------------------- eval contract -----------------------------
 
 
+def _install_letter_constraint(llm, tokenizer):
+    """Register a forward hook that masks the first generated token's logits to
+    be one of {A..E} only.
+
+    evaluate.py calls llm.generate(inputs_embeds=..., ...) without a logits_processor
+    so we can't inject one that way. Instead we hook the LLM's forward: on the
+    prefill pass (seq_len > 1) we additively mask non-letter logits at position -1,
+    which is what generate() reads to pick the first new token. Subsequent
+    auto-regressive steps have seq_len == 1 and are left untouched.
+    """
+    letter_ids = []
+    for L in "ABCDE":
+        # Chat-template prompts end with '\n', so generate() conditions on a newline
+        # and the "A" token (no leading space) is what follows. We also include
+        # " A" and "(A)" fallbacks to be robust to other templates.
+        for variant in (L, " " + L, "\n" + L, "(" + L):
+            tids = tokenizer.encode(variant, add_special_tokens=False)
+            if len(tids) == 1:
+                letter_ids.append(tids[0]); break
+        else:
+            tids = tokenizer.encode(L, add_special_tokens=False)
+            if tids:
+                letter_ids.append(tids[0])
+    letter_ids = sorted(set(letter_ids))
+    ids_tensor = torch.tensor(letter_ids, dtype=torch.long)
+
+    def hook(module, inputs, output):
+        logits = getattr(output, "logits", None)
+        if logits is None:
+            return output
+        # Modern HF generate uses logits_to_keep=1, so logits shape is (B, 1, V)
+        # every call. Mask all positions — normalize_answer() only reads the first
+        # letter, so emitting "AAAAAA" is equivalent to emitting "A" for MCQ.
+        V = logits.size(-1)
+        mask = torch.full((V,), float("-inf"), device=logits.device, dtype=logits.dtype)
+        mask[ids_tensor.to(logits.device)] = 0.0
+        output.logits = logits + mask
+        return output
+
+    # PeftModel.forward / LoraModel.forward don't propagate forward hooks in
+    # the usual way — only the inner base Qwen2ForCausalLM fires hooks during
+    # generate(). Walk down to find it.
+    target = llm
+    for attr in ("base_model", "model"):
+        if hasattr(target, attr):
+            target = getattr(target, attr)
+    handle = target.register_forward_hook(hook)
+    return handle, letter_ids
+
+
 def build_components():
     """Entry point called by eval/evaluate.py."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -310,6 +369,9 @@ def build_components():
     if Path("final_projection.ptz").exists():
         load_projection_compressed("final_projection.ptz", proj)
     proj = proj.to(device)
+    if HP.letter_constraint:
+        _, letter_ids = _install_letter_constraint(llm, tokenizer)
+        print(f"[build] letter-constraint on first gen token: ids={letter_ids}", flush=True)
     return proj, llm, tokenizer, siglip_hidden, llm_hidden, prompt_template
 
 
