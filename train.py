@@ -84,8 +84,12 @@ class HP:
     # of the trainable params and save the EMA copy. Reduces end-of-training
     # variance from individual batches. Starts at `ema_start_step` so we don't
     # average in random-init state.
-    ema_decay = float(os.environ.get("EMA_DECAY", 0.99))
+    # EMA disabled by default — decay=0.99 averaged over ~100 steps diluted the
+    # final state (0.674 vs 0.714 w/o). Keep as opt-in for tuning experiments.
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
     ema_start_step = int(os.environ.get("EMA_START_STEP", 100))
+    # LoRA dropout — standard SFT regularizer, helps small-data overfitting.
+    lora_dropout = float(os.environ.get("LORA_DROPOUT", 0.1))
 
 
 # ----------------------------- prompt -----------------------------
@@ -178,7 +182,7 @@ def maybe_apply_lora(llm):
     cfg_kwargs = dict(
         r=HP.lora_rank,
         lora_alpha=HP.lora_alpha,
-        lora_dropout=0.0,
+        lora_dropout=HP.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
