@@ -59,10 +59,10 @@ class HP:
     # NEFTune (Jain et al. 2023): add uniform noise to text embeddings during
     # SFT. magnitude = alpha / sqrt(L*D). Paper default alpha=5 → ~+15% on small
     # instruction-tuning sets. Applied only in training, not eval.
-    neft_alpha = float(os.environ.get("NEFT_ALPHA", 5.0))
+    neft_alpha = float(os.environ.get("NEFT_ALPHA", 2.0))
     # DoRA (Liu et al. 2024): weight-decomposed LoRA — adds a learnable magnitude
     # per adapted weight column. PEFT flips this on with use_dora=True.
-    use_dora = os.environ.get("USE_DORA", "1") not in ("0", "false", "False")
+    use_dora = os.environ.get("USE_DORA", "0") not in ("0", "false", "False")
     # LoRA+ (Hayou et al. 2024): scale the LR for the B matrix (up-projector)
     # relative to A (down-projector). Paper recommends ratio around 16.
     lora_plus_ratio = float(os.environ.get("LORA_PLUS_RATIO", 1.0))
