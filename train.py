@@ -55,7 +55,9 @@ class HP:
     cosine_decay = os.environ.get("COSINE_DECAY", "1") not in ("0", "false", "False")
     # Probability of shuffling multiple-choice options per training example.
     # Observed 20% B→A confusion at eval — the model leans on option position.
-    choice_shuffle_prob = float(os.environ.get("CHOICE_SHUFFLE_PROB", 0.0))
+    # Turning on at 1.0: shuffles every example, effectively multiplying data by
+    # ~k! (k = #choices) and destroying position bias in the (letter, content) map.
+    choice_shuffle_prob = float(os.environ.get("CHOICE_SHUFFLE_PROB", 1.0))
     # NEFTune (Jain et al. 2023): add uniform noise to text embeddings during
     # SFT. magnitude = alpha / sqrt(L*D). Paper default alpha=5 → ~+15% on small
     # instruction-tuning sets. Applied only in training, not eval.
@@ -91,8 +93,8 @@ class HP:
     # LoRA dropout — standard SFT regularizer, helps small-data overfitting.
     # Verified: 0.7800 @ 0.1, 0.7720 @ 0.0, 0.7280 @ 0.2. Sweet spot at 0.1.
     lora_dropout = float(os.environ.get("LORA_DROPOUT", 0.1))
-    # Label smoothing on next-token CE — orthogonal regularizer to dropout.
-    label_smoothing = float(os.environ.get("LABEL_SMOOTHING", 0.1))
+    # Label smoothing: tested at 0.1, landed 0.7540 (-0.026, within noise). Off.
+    label_smoothing = float(os.environ.get("LABEL_SMOOTHING", 0.0))
 
 
 # ----------------------------- prompt -----------------------------
