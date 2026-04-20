@@ -41,7 +41,7 @@ import torch.nn.functional as F
 class HP:
     seed = int(os.environ.get("SEED", 1337))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    batch_size = int(os.environ.get("BATCH_SIZE", 4))
+    batch_size = int(os.environ.get("BATCH_SIZE", 8))
     lr_proj = float(os.environ.get("LR_PROJ", 5e-4))
     lr_lora = float(os.environ.get("LR_LORA", 2e-4))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 100))
@@ -115,18 +115,21 @@ class LinearProjection(nn.Module):
 
 
 class MLPProjection(nn.Module):
-    def __init__(self, in_dim: int, hidden: int, out_dim: int, pool: int = 1):
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, pool: int = 1, use_norm: bool = True):
         super().__init__()
         self.pool = pool
         self.fc1 = nn.Linear(in_dim, hidden)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden, out_dim)
+        # LayerNorm on output so projected image tokens match the magnitude
+        # distribution of the frozen LLM's token embeddings.
+        self.norm = nn.LayerNorm(out_dim) if use_norm else nn.Identity()
         _init_proj_linear(self.fc1)
         _init_proj_linear(self.fc2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = _pool_patches(x, self.pool)
-        return self.fc2(self.act(self.fc1(x)))
+        return self.norm(self.fc2(self.act(self.fc1(x))))
 
 
 def make_projection(kind: str, in_dim: int, out_dim: int, hidden: int, pool: int = 1) -> nn.Module:
