@@ -57,9 +57,13 @@ class HP:
     projection_hidden = int(os.environ.get("PROJECTION_HIDDEN", 1024))
     # 1 = no pool (196 tokens), 2 = 2x2 spatial avg pool (49 tokens)
     patch_pool = int(os.environ.get("PATCH_POOL", 1))
-    # Validation-based checkpoint selection: how often (steps), how many val examples.
-    val_every_steps = int(os.environ.get("VAL_EVERY_STEPS", 400))
-    val_max_examples = int(os.environ.get("VAL_MAX_EXAMPLES", 200))
+    # Validation-based checkpoint selection (disabled by default — n=200 val was
+    # too noisy vs. final-step test acc in our test). Set VAL_EVERY_STEPS>0 to enable.
+    val_every_steps = int(os.environ.get("VAL_EVERY_STEPS", 0))
+    val_max_examples = int(os.environ.get("VAL_MAX_EXAMPLES", 500))
+    # Stage-wise training: hold LoRA LR at 0 until this step so the projection
+    # can align with the frozen LM's embedding space first (LLaVA-style stage 1).
+    lora_start_step = int(os.environ.get("LORA_START_STEP", 300))
     cosine_decay = os.environ.get("COSINE_DECAY", "1") not in ("0", "false", "False")
 
 
@@ -475,7 +479,10 @@ def main():
             break
         opt.param_groups[0]["lr"] = lr_at(step, HP.lr_proj, HP.warmup_steps, est_total_steps, HP.cosine_decay)
         if len(opt.param_groups) > 1:
-            opt.param_groups[1]["lr"] = lr_at(step, HP.lr_lora, HP.warmup_steps, est_total_steps, HP.cosine_decay)
+            lora_lr = lr_at(step, HP.lr_lora, HP.warmup_steps, est_total_steps, HP.cosine_decay)
+            if step < HP.lora_start_step:
+                lora_lr = 0.0
+            opt.param_groups[1]["lr"] = lora_lr
 
         batch = build_training_batch(tokenizer, train_ds, rng, device, llm, proj, llm_dtype)
         if batch is None:
