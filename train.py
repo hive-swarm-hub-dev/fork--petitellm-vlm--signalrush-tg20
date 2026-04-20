@@ -59,10 +59,14 @@ class HP:
     # NEFTune (Jain et al. 2023): add uniform noise to text embeddings during
     # SFT. magnitude = alpha / sqrt(L*D). Paper default alpha=5 → ~+15% on small
     # instruction-tuning sets. Applied only in training, not eval.
-    neft_alpha = float(os.environ.get("NEFT_ALPHA", 0.0))
+    neft_alpha = float(os.environ.get("NEFT_ALPHA", 2.0))
+    # If set, mask the EOS token (and any trailing tokens) from the CE loss so all
+    # gradient goes to predicting the single answer letter. Useful for MCQ tasks
+    # where EOS prediction is trivial and dilutes the useful signal.
+    answer_only_loss = os.environ.get("ANSWER_ONLY_LOSS", "1") not in ("0", "false", "False")
     # DoRA (Liu et al. 2024): weight-decomposed LoRA — adds a learnable magnitude
     # per adapted weight column. PEFT flips this on with use_dora=True.
-    use_dora = os.environ.get("USE_DORA", "1") not in ("0", "false", "False")
+    use_dora = os.environ.get("USE_DORA", "0") not in ("0", "false", "False")
     # LoRA+ (Hayou et al. 2024): scale the LR for the B matrix (up-projector)
     # relative to A (down-projector). Paper recommends ratio around 16.
     lora_plus_ratio = float(os.environ.get("LORA_PLUS_RATIO", 1.0))
@@ -367,6 +371,14 @@ def build_training_batch(tokenizer, ds: SqaDataset, rng, device, llm, proj, llm_
         pl = int(prompt_lens[i].item())
         label_text[i, :pl] = -100
     label_text = torch.where(full_mask.bool(), label_text, torch.full_like(label_text, -100))
+    if HP.answer_only_loss:
+        # Mask the EOS token (always the last non-pad token) so all gradient
+        # flows through the answer letter, not the trivial EOS prediction.
+        full_lens = full_mask.sum(dim=1)
+        for i in range(B):
+            fl = int(full_lens[i].item())
+            if fl > 0:
+                label_text[i, fl - 1] = -100
     # Prepend -100 for image positions.
     img_labels = torch.full((B, Np), -100, dtype=label_text.dtype, device=device)
     labels = torch.cat([img_labels, label_text], dim=1)
