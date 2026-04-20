@@ -59,11 +59,11 @@ class HP:
     # NEFTune (Jain et al. 2023): add uniform noise to text embeddings during
     # SFT. magnitude = alpha / sqrt(L*D). Paper default alpha=5 → ~+15% on small
     # instruction-tuning sets. Applied only in training, not eval.
-    neft_alpha = float(os.environ.get("NEFT_ALPHA", 2.0))
+    neft_alpha = float(os.environ.get("NEFT_ALPHA", 0.0))
     # If set, mask the EOS token (and any trailing tokens) from the CE loss so all
     # gradient goes to predicting the single answer letter. Useful for MCQ tasks
     # where EOS prediction is trivial and dilutes the useful signal.
-    answer_only_loss = os.environ.get("ANSWER_ONLY_LOSS", "1") not in ("0", "false", "False")
+    answer_only_loss = os.environ.get("ANSWER_ONLY_LOSS", "0") not in ("0", "false", "False")
     # DoRA (Liu et al. 2024): weight-decomposed LoRA — adds a learnable magnitude
     # per adapted weight column. PEFT flips this on with use_dora=True.
     use_dora = os.environ.get("USE_DORA", "0") not in ("0", "false", "False")
