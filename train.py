@@ -40,6 +40,7 @@ class HP:
     seed = int(os.environ.get("SEED", 1337))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     batch_size = int(os.environ.get("BATCH_SIZE", 8))
+    grad_accum = int(os.environ.get("GRAD_ACCUM", 2))
     lr_proj = float(os.environ.get("LR_PROJ", 5e-4))
     lr_lora = float(os.environ.get("LR_LORA", 2e-4))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 100))
@@ -355,17 +356,28 @@ def main():
         if len(opt.param_groups) > 1:
             opt.param_groups[1]["lr"] = lr_at(step, HP.lr_lora, HP.warmup_steps, est_total_steps, HP.cosine_decay)
 
-        batch = build_training_batch(tokenizer, train_ds, rng, device, llm, proj, llm_dtype)
-        if batch is None:
-            step += 1; continue
-        inputs_embeds, attn_mask, labels = batch
-        out = llm(inputs_embeds=inputs_embeds, attention_mask=attn_mask, labels=labels)
-        loss = out.loss
-        if not torch.isfinite(loss):
-            print(f"[skip] step={step} non-finite loss; dropping batch", flush=True)
-            step += 1; continue
+        # Gradient accumulation: accumulate GRAD_ACCUM micro-batches before one
+        # opt.step() so effective batch is batch_size * grad_accum with the same
+        # memory footprint.
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        acc_bad = False
+        acc_loss = 0.0
+        accum = max(1, HP.grad_accum)
+        for micro in range(accum):
+            batch = build_training_batch(tokenizer, train_ds, rng, device, llm, proj, llm_dtype)
+            if batch is None:
+                continue
+            inputs_embeds, attn_mask, labels = batch
+            out = llm(inputs_embeds=inputs_embeds, attention_mask=attn_mask, labels=labels)
+            loss = out.loss
+            if not torch.isfinite(loss):
+                print(f"[skip] step={step} micro={micro} non-finite loss", flush=True)
+                acc_bad = True; break
+            (loss / accum).backward()
+            acc_loss += float(loss.item()) / accum
+        if acc_bad:
+            opt.zero_grad(set_to_none=True)
+            step += 1; continue
         # Detect NaN/inf gradients before they corrupt optimizer state.
         bad_grad = False
         for g in opt.param_groups:
@@ -381,6 +393,7 @@ def main():
             torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], HP.grad_clip)
         opt.step()
         step += 1
+        loss_disp = acc_loss
         if step == 50 and not calib_done:
             calib_dt = time.time() - start
             steps_per_sec = 50.0 / max(1e-6, calib_dt)
@@ -389,7 +402,7 @@ def main():
             calib_done = True
             print(f"[calib] {steps_per_sec:.2f} steps/s -> est_total_steps={est_total_steps}", flush=True)
         if step % 50 == 0:
-            print(f"step={step} t={elapsed:.0f}s loss={loss.item():.4f} "
+            print(f"step={step} t={elapsed:.0f}s loss={loss_disp:.4f} "
                   f"lr_proj={opt.param_groups[0]['lr']:.2e}", flush=True)
 
     # Save artifacts.
