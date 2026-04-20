@@ -22,6 +22,8 @@ import json
 import math
 import os
 import random
+import re
+import string as _string
 import sys
 import time
 import zlib
@@ -53,13 +55,18 @@ class HP:
     lora_mlp_rank = int(os.environ.get("LORA_MLP_RANK", 4))
     projection_type = os.environ.get("PROJECTION_TYPE", "mlp")  # linear|mlp
     projection_hidden = int(os.environ.get("PROJECTION_HIDDEN", 1024))
+    # 1 = no pool (196 tokens), 2 = 2x2 spatial avg pool (49 tokens)
+    patch_pool = int(os.environ.get("PATCH_POOL", 1))
+    # Validation-based checkpoint selection: how often (steps), how many val examples.
+    val_every_steps = int(os.environ.get("VAL_EVERY_STEPS", 400))
+    val_max_examples = int(os.environ.get("VAL_MAX_EXAMPLES", 200))
     cosine_decay = os.environ.get("COSINE_DECAY", "1") not in ("0", "false", "False")
 
 
 # ----------------------------- prompt -----------------------------
 
 
-PROMPT_STYLE = os.environ.get("PROMPT_STYLE", "qa")  # chat|qa
+PROMPT_STYLE = os.environ.get("PROMPT_STYLE", "chat")  # chat|qa
 SYSTEM_PROMPT = "You are a helpful visual assistant. Answer concisely with the correct option letter only."
 
 def prompt_template(question: str) -> str:
@@ -79,19 +86,34 @@ def _init_proj_linear(m: nn.Linear):
         nn.init.zeros_(m.bias)
 
 
+def _pool_patches(x: torch.Tensor, pool: int) -> torch.Tensor:
+    """Spatially avg-pool a (B, N, D) patch sequence, where N=G*G (square grid)."""
+    if pool <= 1:
+        return x
+    B, N, D = x.shape
+    G = int(round(N ** 0.5))
+    if G * G != N or G % pool != 0:
+        return x  # not a square grid evenly divisible by `pool`; skip
+    x = x.view(B, G, G, D).permute(0, 3, 1, 2)  # (B, D, G, G)
+    x = F.avg_pool2d(x, kernel_size=pool, stride=pool)
+    return x.permute(0, 2, 3, 1).flatten(1, 2)  # (B, (G/pool)^2, D)
+
+
 class LinearProjection(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int):
+    def __init__(self, in_dim: int, out_dim: int, pool: int = 1):
         super().__init__()
+        self.pool = pool
         self.linear = nn.Linear(in_dim, out_dim)
         _init_proj_linear(self.linear)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        return self.linear(_pool_patches(x, self.pool))
 
 
 class MLPProjection(nn.Module):
-    def __init__(self, in_dim: int, hidden: int, out_dim: int):
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, pool: int = 1):
         super().__init__()
+        self.pool = pool
         self.fc1 = nn.Linear(in_dim, hidden)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden, out_dim)
@@ -99,13 +121,14 @@ class MLPProjection(nn.Module):
         _init_proj_linear(self.fc2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _pool_patches(x, self.pool)
         return self.fc2(self.act(self.fc1(x)))
 
 
-def make_projection(kind: str, in_dim: int, out_dim: int, hidden: int) -> nn.Module:
+def make_projection(kind: str, in_dim: int, out_dim: int, hidden: int, pool: int = 1) -> nn.Module:
     if kind == "mlp":
-        return MLPProjection(in_dim, hidden, out_dim)
-    return LinearProjection(in_dim, out_dim)
+        return MLPProjection(in_dim, hidden, out_dim, pool=pool)
+    return LinearProjection(in_dim, out_dim, pool=pool)
 
 
 # ----------------------------- backbone loading -----------------------------
@@ -264,7 +287,7 @@ def build_components():
     if HP.use_lora and Path("final_lora.safetensors").exists():
         llm = maybe_apply_lora(llm)
         llm = load_lora(llm, "final_lora.safetensors")
-    proj = make_projection(HP.projection_type, siglip_hidden, llm_hidden, HP.projection_hidden)
+    proj = make_projection(HP.projection_type, siglip_hidden, llm_hidden, HP.projection_hidden, pool=HP.patch_pool)
     if Path("final_projection.ptz").exists():
         load_projection_compressed("final_projection.ptz", proj)
     proj = proj.to(device)
@@ -329,6 +352,70 @@ def build_training_batch(tokenizer, ds: SqaDataset, rng, device, llm, proj, llm_
     return inputs_embeds, attn_mask, labels
 
 
+def _normalize_answer(s: str) -> str:
+    """Mirror of eval/evaluate.py:normalize_answer so val during training matches."""
+    if s is None:
+        return ""
+    s = s.strip().lower()
+    m = re.search(r"\(([a-z])\)|^\s*([a-z])[\).:\-\s]", s)
+    if m:
+        return m.group(1) or m.group(2)
+    s = s.translate(str.maketrans("", "", _string.punctuation)).strip()
+    return s.split()[0] if s else ""
+
+
+@torch.inference_mode()
+def val_accuracy(llm, proj, tokenizer, device, llm_dtype, val_rows, batch_size: int = 16) -> float:
+    """Run greedy generation on a subset of the val split. Mirrors eval/evaluate.py."""
+    was_training = llm.training
+    llm.eval(); proj.eval()
+    prev_pad = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    eos = tokenizer.eos_token_id or 0
+    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
+    correct = 0; total = 0
+    try:
+        for i in range(0, len(val_rows), batch_size):
+            batch = val_rows[i:i + batch_size]
+            feats = []
+            texts = []
+            keep = []
+            for ex in batch:
+                fp = Path(f"data/vision_cache/{ex['image_id']}.pt")
+                if not fp.exists():
+                    continue
+                feats.append(torch.load(fp, map_location="cpu"))
+                texts.append(prompt_template(ex["prompt"]))
+                keep.append(ex)
+            if not feats:
+                continue
+            feats_t = torch.stack(feats).to(device).float()
+            projected = proj(feats_t).to(llm_dtype)
+            tok = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=HP.max_text_len)
+            ids = tok["input_ids"].to(device); m = tok["attention_mask"].to(device)
+            te = llm.get_input_embeddings()(ids).to(llm_dtype)
+            B, Np, _ = projected.shape
+            img_mask = torch.ones(B, Np, dtype=m.dtype, device=device)
+            ie = torch.cat([projected, te], dim=1)
+            am = torch.cat([img_mask, m], dim=1)
+            out = llm.generate(inputs_embeds=ie, attention_mask=am,
+                               max_new_tokens=8, do_sample=False,
+                               pad_token_id=pad, eos_token_id=eos)
+            if out.size(1) > 8:
+                out = out[:, -8:]
+            for j, ex in enumerate(keep):
+                dec = tokenizer.decode(out[j], skip_special_tokens=True)
+                if _normalize_answer(dec) == _normalize_answer(ex["answer"]):
+                    correct += 1
+                total += 1
+    finally:
+        tokenizer.padding_side = prev_pad
+        if was_training:
+            llm.train()
+        proj.train()
+    return correct / max(total, 1)
+
+
 def lr_at(step: int, peak: float, warmup: int, total: int = 0, cosine: bool = False) -> float:
     if step < warmup:
         return peak * (step + 1) / warmup
@@ -352,14 +439,16 @@ def main():
     if HP.use_lora:
         llm = maybe_apply_lora(llm)
 
-    proj = make_projection(HP.projection_type, siglip_hidden, llm_hidden, HP.projection_hidden).to(device)
+    proj = make_projection(HP.projection_type, siglip_hidden, llm_hidden, HP.projection_hidden, pool=HP.patch_pool).to(device)
     for p in proj.parameters(): p.requires_grad = True
     print(f"projection params: {sum(p.numel() for p in proj.parameters())/1e6:.3f}M", flush=True)
 
     train_ds = SqaDataset("data/sqa_train.jsonl")
     if len(train_ds) == 0:
         print("ERROR: no training data at data/sqa_train.jsonl", file=sys.stderr); sys.exit(2)
-    print(f"train n={len(train_ds)}", flush=True)
+    val_ds = SqaDataset("data/sqa_val.jsonl")
+    val_rows = val_ds.rows[:HP.val_max_examples] if HP.val_every_steps > 0 else []
+    print(f"train n={len(train_ds)} val n={len(val_rows)}", flush=True)
 
     # Optimizer groups.
     proj_params = list(proj.parameters())
@@ -376,6 +465,10 @@ def main():
     est_total_steps = 0
     calib_done = False
     calib_t0 = None
+    best_val = -1.0
+    best_proj_sd = None
+    best_lora_sd = None
+    next_val_step = HP.val_every_steps if HP.val_every_steps > 0 else None
     while True:
         elapsed = time.time() - start
         if elapsed >= HP.max_wallclock_seconds:
@@ -420,6 +513,37 @@ def main():
         if step % 50 == 0:
             print(f"step={step} t={elapsed:.0f}s loss={loss.item():.4f} "
                   f"lr_proj={opt.param_groups[0]['lr']:.2e}", flush=True)
+
+        # Periodic val-acc based checkpoint selection.
+        if next_val_step is not None and step >= next_val_step and val_rows:
+            # Leave a budget buffer so val itself doesn't run past wallclock.
+            if HP.max_wallclock_seconds - elapsed > 30:
+                val_t0 = time.time()
+                val_acc = val_accuracy(llm, proj, tokenizer, device, llm_dtype, val_rows)
+                val_dt = time.time() - val_t0
+                if val_acc > best_val:
+                    best_val = val_acc
+                    best_proj_sd = {k: v.detach().cpu().clone() for k, v in proj.state_dict().items()}
+                    best_lora_sd = None
+                    if HP.use_lora:
+                        best_lora_sd = {k: v.detach().to(torch.bfloat16).cpu().clone()
+                                         for k, v in llm.state_dict().items() if "lora_" in k}
+                    tag = " [best]"
+                else:
+                    tag = ""
+                print(f"[val] step={step} val_acc={val_acc:.4f} best={best_val:.4f} "
+                      f"t_val={val_dt:.1f}s{tag}", flush=True)
+            next_val_step = step + HP.val_every_steps
+
+    # Restore best-val checkpoint if one was captured during training.
+    if best_proj_sd is not None:
+        proj.load_state_dict({k: v.to(next(proj.parameters()).device) for k, v in best_proj_sd.items()})
+        if HP.use_lora and best_lora_sd is not None:
+            llm_sd = llm.state_dict()
+            for k, v in best_lora_sd.items():
+                if k in llm_sd:
+                    llm_sd[k].copy_(v.to(llm_sd[k].dtype).to(llm_sd[k].device))
+        print(f"[ckpt] restored best val_acc={best_val:.4f} before save", flush=True)
 
     # Save artifacts.
     proj_bytes = save_projection_compressed(proj, "final_projection.ptz")
