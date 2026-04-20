@@ -65,7 +65,7 @@ class HP:
     use_dora = os.environ.get("USE_DORA", "1") not in ("0", "false", "False")
     # LoRA+ (Hayou et al. 2024): scale the LR for the B matrix (up-projector)
     # relative to A (down-projector). Paper recommends ratio around 16.
-    lora_plus_ratio = float(os.environ.get("LORA_PLUS_RATIO", 16.0))
+    lora_plus_ratio = float(os.environ.get("LORA_PLUS_RATIO", 1.0))
 
 
 # ----------------------------- prompt -----------------------------
