@@ -89,9 +89,10 @@ class HP:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
     ema_start_step = int(os.environ.get("EMA_START_STEP", 100))
     # LoRA dropout — standard SFT regularizer, helps small-data overfitting.
-    # Verified: 0.7800 vs 0.7720 without (dropout=0.0), single-seed.
-    # Train loss still drops to ~0.04 at budget end (memorization), so try heavier regularization.
-    lora_dropout = float(os.environ.get("LORA_DROPOUT", 0.2))
+    # Verified: 0.7800 @ 0.1, 0.7720 @ 0.0, 0.7280 @ 0.2. Sweet spot at 0.1.
+    lora_dropout = float(os.environ.get("LORA_DROPOUT", 0.1))
+    # Label smoothing on next-token CE — orthogonal regularizer to dropout.
+    label_smoothing = float(os.environ.get("LABEL_SMOOTHING", 0.1))
 
 
 # ----------------------------- prompt -----------------------------
@@ -560,8 +561,20 @@ def main():
         if batch is None:
             step += 1; continue
         inputs_embeds, attn_mask, labels = batch
-        out = llm(inputs_embeds=inputs_embeds, attention_mask=attn_mask, labels=labels)
-        loss = out.loss
+        if HP.label_smoothing > 0:
+            out = llm(inputs_embeds=inputs_embeds, attention_mask=attn_mask)
+            # Next-token CE with label smoothing: shift logits/labels like HF does.
+            logits = out.logits[:, :-1, :].contiguous()
+            lab = labels[:, 1:].contiguous()
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)).float(),
+                lab.view(-1),
+                ignore_index=-100,
+                label_smoothing=HP.label_smoothing,
+            )
+        else:
+            out = llm(inputs_embeds=inputs_embeds, attention_mask=attn_mask, labels=labels)
+            loss = out.loss
         if not torch.isfinite(loss):
             print(f"[skip] step={step} non-finite loss; dropping batch", flush=True)
             step += 1; continue
