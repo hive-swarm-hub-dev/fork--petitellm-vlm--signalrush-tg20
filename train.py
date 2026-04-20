@@ -80,6 +80,12 @@ class HP:
     # mask all non-{A..E} tokens on the first generated token so the model cannot
     # emit "The" or " (" or whitespace that would torpedo the regex answer extract.
     letter_constraint = os.environ.get("LETTER_CONSTRAINT", "1") not in ("0", "false", "False")
+    # EMA weight averaging (Polyak averaging): track an exponential moving avg
+    # of the trainable params and save the EMA copy. Reduces end-of-training
+    # variance from individual batches. Starts at `ema_start_step` so we don't
+    # average in random-init state.
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.99))
+    ema_start_step = int(os.environ.get("EMA_START_STEP", 100))
 
 
 # ----------------------------- prompt -----------------------------
@@ -518,6 +524,10 @@ def main():
     print(f"optimizer groups: {[(g['group'], len(g['params']), g['lr']) for g in param_groups]}", flush=True)
     opt = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), weight_decay=0.0)
 
+    # EMA shadow state — populated lazily on first post-warmup step.
+    ema_proj_sd = None
+    ema_lora_sd = None
+
     start = time.time()
     step = 0
     rng = np.random.default_rng(HP.seed)
@@ -566,6 +576,24 @@ def main():
             torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], HP.grad_clip)
         opt.step()
         step += 1
+
+        # EMA update (after opt.step so we avg the post-update weights).
+        if HP.ema_decay > 0 and step >= HP.ema_start_step:
+            d = HP.ema_decay
+            with torch.no_grad():
+                if ema_proj_sd is None:
+                    ema_proj_sd = {k: v.detach().clone() for k, v in proj.state_dict().items()}
+                    if HP.use_lora:
+                        ema_lora_sd = {k: v.detach().to(torch.bfloat16).clone()
+                                        for k, v in llm.state_dict().items() if "lora_" in k}
+                else:
+                    for k, v in proj.state_dict().items():
+                        ema_proj_sd[k].mul_(d).add_(v.detach(), alpha=1 - d)
+                    if ema_lora_sd is not None:
+                        for k, v in llm.state_dict().items():
+                            if "lora_" in k and k in ema_lora_sd:
+                                ema_lora_sd[k].mul_(d).add_(v.detach().to(torch.bfloat16), alpha=1 - d)
+
         if step == 50 and not calib_done:
             calib_dt = time.time() - start
             steps_per_sec = 50.0 / max(1e-6, calib_dt)
@@ -576,6 +604,19 @@ def main():
         if step % 50 == 0:
             print(f"step={step} t={elapsed:.0f}s loss={loss.item():.4f} "
                   f"lr_proj={opt.param_groups[0]['lr']:.2e}", flush=True)
+
+    # Load EMA state into the live modules before saving — this makes the saved
+    # artifact be the time-averaged weights, which typically generalize better
+    # than any single step's weights.
+    if HP.ema_decay > 0 and ema_proj_sd is not None:
+        dev = next(proj.parameters()).device
+        proj.load_state_dict({k: v.to(dev) for k, v in ema_proj_sd.items()})
+        if ema_lora_sd is not None:
+            llm_sd = llm.state_dict()
+            for k, v in ema_lora_sd.items():
+                if k in llm_sd:
+                    llm_sd[k].copy_(v.to(llm_sd[k].dtype).to(llm_sd[k].device))
+        print(f"[ema] restored EMA(decay={HP.ema_decay}) weights before save", flush=True)
 
     # Save artifacts.
     proj_bytes = save_projection_compressed(proj, "final_projection.ptz")
