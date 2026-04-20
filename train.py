@@ -41,7 +41,7 @@ import torch.nn.functional as F
 class HP:
     seed = int(os.environ.get("SEED", 1337))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    batch_size = int(os.environ.get("BATCH_SIZE", 8))
+    batch_size = int(os.environ.get("BATCH_SIZE", 4))
     lr_proj = float(os.environ.get("LR_PROJ", 5e-4))
     lr_lora = float(os.environ.get("LR_LORA", 2e-4))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 100))
@@ -49,8 +49,8 @@ class HP:
     max_text_len = int(os.environ.get("MAX_TEXT_LEN", 384))
     max_answer_len = int(os.environ.get("MAX_ANSWER_LEN", 16))
     use_lora = os.environ.get("USE_LORA", "1") not in ("0", "false", "False")
-    lora_rank = int(os.environ.get("LORA_RANK", 44))
-    lora_alpha = int(os.environ.get("LORA_ALPHA", 88))
+    lora_rank = int(os.environ.get("LORA_RANK", 32))
+    lora_alpha = int(os.environ.get("LORA_ALPHA", 64))
     lora_target = os.environ.get("LORA_TARGET", "qkvo")  # qkvo|all|qkvo_mlp4
     lora_mlp_rank = int(os.environ.get("LORA_MLP_RANK", 4))
     projection_type = os.environ.get("PROJECTION_TYPE", "mlp")  # linear|mlp
