@@ -334,13 +334,24 @@ def _install_letter_constraint(llm, tokenizer):
     letter_ids = sorted(set(letter_ids))
     ids_tensor = torch.tensor(letter_ids, dtype=torch.long)
 
-    def hook(module, inputs, output):
+    def hook(module, args, kwargs, output):
         logits = getattr(output, "logits", None)
         if logits is None:
             return output
-        # Modern HF generate uses logits_to_keep=1, so logits shape is (B, 1, V)
-        # every call. Mask all positions — normalize_answer() only reads the first
-        # letter, so emitting "AAAAAA" is equivalent to emitting "A" for MCQ.
+        # Only constrain the *first* generated token. Subsequent tokens must be
+        # free to emit EOS, otherwise the decoded string "BBBB" doesn't match
+        # the `[a-z][\).:\-\s]` regex in normalize_answer and falls back to the
+        # whole string — which compares != single-letter gold. Detect prefill
+        # via past_key_values: absent or empty on the first forward call.
+        past = kwargs.get("past_key_values")
+        is_prefill = past is None
+        if not is_prefill and hasattr(past, "get_seq_length"):
+            try:
+                is_prefill = past.get_seq_length() == 0
+            except TypeError:
+                is_prefill = False
+        if not is_prefill:
+            return output
         V = logits.size(-1)
         mask = torch.full((V,), float("-inf"), device=logits.device, dtype=logits.dtype)
         mask[ids_tensor.to(logits.device)] = 0.0
@@ -354,7 +365,9 @@ def _install_letter_constraint(llm, tokenizer):
     for attr in ("base_model", "model"):
         if hasattr(target, attr):
             target = getattr(target, attr)
-    handle = target.register_forward_hook(hook)
+    # with_kwargs=True is required so the hook can inspect past_key_values
+    # (needs torch >= 2.0).
+    handle = target.register_forward_hook(hook, with_kwargs=True)
     return handle, letter_ids
 
 
