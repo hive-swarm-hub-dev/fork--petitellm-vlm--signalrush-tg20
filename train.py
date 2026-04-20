@@ -72,7 +72,10 @@ class HP:
     lora_plus_ratio = float(os.environ.get("LORA_PLUS_RATIO", 1.0))
     # RSLoRA (Kalajdzievski 2023): scale adapter by α/√r instead of α/r so effective
     # LR doesn't collapse as rank grows. PEFT supports via use_rslora=True.
-    use_rslora = os.environ.get("USE_RSLORA", "1") not in ("0", "false", "False")
+    # Disabled by default — at α=64/r=32, RSLoRA α/√r scaling jumps to 11.3
+    # (5.65× the standard α/r=2.0). That destabilizes training unless α is
+    # retuned. Leaving the flag in place for future experiments.
+    use_rslora = os.environ.get("USE_RSLORA", "0") not in ("0", "false", "False")
     # Letter-constrained decoding (LLaVA-1.5 / Cambrian-1 MCQ protocol): at eval time,
     # mask all non-{A..E} tokens on the first generated token so the model cannot
     # emit "The" or " (" or whitespace that would torpedo the regex answer extract.

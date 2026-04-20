@@ -120,6 +120,13 @@ def main():
     llm = llm.to(device).eval()
     dtype = next(p.dtype for p in llm.parameters() if p.dtype in (torch.bfloat16, torch.float16, torch.float32))
 
+    # Batched generate(inputs_embeds=...) requires left-padding: with
+    # right-padding the shorter prompts in a batch get EOS pad tokens appended
+    # *after* the assistant cue, so the model samples EOS on the very first new
+    # token and emits nothing. Set this unconditionally so every agent's
+    # build_components() is robust by default.
+    tokenizer.padding_side = "left"
+
     use_native = supports_generate_inputs_embeds(llm, tokenizer, device, dtype)
     print(f"[eval] native generate(inputs_embeds=...): {use_native}", file=sys.stderr)
 
